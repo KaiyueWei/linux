@@ -118,8 +118,14 @@ static struct cache_ext_ops __bpf_cache_ext_ops = {
 	.evict_folios   = cache_ext_ops__evict_folios,
 };
 
+static int cache_ext_init(struct btf *btf)
+{
+	return 0;
+}
+
 static struct bpf_struct_ops bpf_cache_ext_ops = {
 	.verifier_ops = &cache_ext_verifier_ops,
+	.init         = cache_ext_init,
 	.check_member = cache_ext_check_member,
 	.init_member  = cache_ext_init_member,
 	.reg          = cache_ext_reg,

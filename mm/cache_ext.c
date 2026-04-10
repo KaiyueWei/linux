@@ -55,6 +55,7 @@ static int cache_ext_btf_struct_access(struct bpf_verifier_log *log,
 }
 
 static const struct bpf_verifier_ops cache_ext_verifier_ops = {
+	.get_func_proto = bpf_base_func_proto,
 	.is_valid_access = cache_ext_is_valid_access,
 	.btf_struct_access = cache_ext_btf_struct_access,
 };

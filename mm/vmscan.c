@@ -6096,18 +6096,61 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
 		for (i = 0; i < ctx.nr_candidates &&
 			    i < CACHE_EXT_MAX_EVICT_BATCH; i++) {
-			struct inode *inode;
+			struct address_space *mapping;
 			struct folio *folio;
 
-			inode = ilookup(NULL, ctx.candidate_ino[i]);
-			if (!inode)
+			/*
+			 * candidate_ino[i] holds the address_space pointer
+			 * (stored in a kernel-only BPF hash map, never in
+			 * arena).  Cast it back and look up the folio via
+			 * the page cache xarray.
+			 */
+			mapping = (struct address_space *)ctx.candidate_ino[i];
+			if (!mapping)
 				continue;
-			folio = filemap_get_folio(inode->i_mapping,
+
+			folio = filemap_get_folio(mapping,
 						  ctx.candidate_idx[i]);
-			iput(inode);
 			if (IS_ERR(folio))
 				continue;
-			/* folio is ref-counted from filemap_get_folio */
+
+			/* folio_lock is required for eviction */
+			folio_lock(folio);
+
+			/*
+			 * Re-check: folio may have been truncated or
+			 * reclaimed between the BPF proposal and now.
+			 */
+			if (folio->mapping != mapping) {
+				folio_unlock(folio);
+				folio_put(folio);
+				continue;
+			}
+
+			/* Skip dirty/writeback/unevictable folios */
+			if (folio_test_dirty(folio) ||
+			    folio_test_writeback(folio) ||
+			    !folio_evictable(folio)) {
+				folio_unlock(folio);
+				folio_put(folio);
+				continue;
+			}
+
+			if (!folio_isolate_lru(folio)) {
+				folio_unlock(folio);
+				folio_put(folio);
+				continue;
+			}
+
+			if (remove_mapping(mapping, folio)) {
+				__folio_clear_lru_flags(folio);
+				sc->nr_reclaimed += folio_nr_pages(folio);
+			} else {
+				/* Failed — put back on LRU */
+				folio_putback_lru(folio);
+			}
+
+			folio_unlock(folio);
 			folio_put(folio);
 		}
 	}

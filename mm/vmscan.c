@@ -6090,6 +6090,9 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		struct cache_ext_eviction_ctx ctx = {
 			.nr_requested = sc->nr_to_reclaim,
 		};
+		LIST_HEAD(folio_list);
+		struct reclaim_stat stat;
+		int nr_isolated = 0;
 		int i;
 
 		active_cache_ext_ops->evict_folios(&ctx, sc->target_mem_cgroup);
@@ -6099,12 +6102,6 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			struct address_space *mapping;
 			struct folio *folio;
 
-			/*
-			 * candidate_ino[i] holds the address_space pointer
-			 * (stored in a kernel-only BPF hash map, never in
-			 * arena).  Cast it back and look up the folio via
-			 * the page cache xarray.
-			 */
 			mapping = (struct address_space *)ctx.candidate_ino[i];
 			if (!mapping)
 				continue;
@@ -6114,44 +6111,52 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			if (IS_ERR(folio))
 				continue;
 
-			/* folio_lock is required for eviction */
-			folio_lock(folio);
+			/*
+			 * Isolate from LRU.  Requires elevated refcount
+			 * (our lookup ref from filemap_get_folio).
+			 * folio_isolate_lru takes its own isolation ref.
+			 */
+			if (!folio_isolate_lru(folio)) {
+				folio_put(folio);
+				continue;
+			}
+
+			/* Drop lookup ref, keep only isolation ref. */
+			folio_put(folio);
 
 			/*
-			 * Re-check: folio may have been truncated or
-			 * reclaimed between the BPF proposal and now.
+			 * shrink_folio_list() expects inactive folios.
+			 * Our candidates may come from the active LRU,
+			 * so clear active/referenced to avoid
+			 * PAGE_FLAGS_CHECK_AT_FREE on the free path.
 			 */
-			if (folio->mapping != mapping) {
-				folio_unlock(folio);
-				folio_put(folio);
-				continue;
-			}
+			folio_clear_active(folio);
+			folio_clear_referenced(folio);
 
-			/* Skip dirty/writeback/unevictable folios */
-			if (folio_test_dirty(folio) ||
-			    folio_test_writeback(folio) ||
-			    !folio_evictable(folio)) {
-				folio_unlock(folio);
-				folio_put(folio);
-				continue;
-			}
+			nr_isolated += folio_nr_pages(folio);
+			list_add(&folio->lru, &folio_list);
+		}
 
-			if (!folio_isolate_lru(folio)) {
-				folio_unlock(folio);
-				folio_put(folio);
-				continue;
-			}
+		if (!list_empty(&folio_list)) {
+			unsigned int nr_reclaimed;
 
-			if (remove_mapping(mapping, folio)) {
-				__folio_clear_lru_flags(folio);
-				sc->nr_reclaimed += folio_nr_pages(folio);
-			} else {
-				/* Failed — put back on LRU */
+			mod_node_page_state(pgdat, NR_ISOLATED_FILE,
+					    nr_isolated);
+
+			nr_reclaimed = shrink_folio_list(&folio_list, pgdat,
+					sc, &stat, false, NULL);
+			sc->nr_reclaimed += nr_reclaimed;
+
+			/* Put back folios that couldn't be reclaimed. */
+			while (!list_empty(&folio_list)) {
+				struct folio *folio = lru_to_folio(&folio_list);
+
+				list_del(&folio->lru);
 				folio_putback_lru(folio);
 			}
 
-			folio_unlock(folio);
-			folio_put(folio);
+			mod_node_page_state(pgdat, NR_ISOLATED_FILE,
+					    -nr_isolated);
 		}
 	}
 

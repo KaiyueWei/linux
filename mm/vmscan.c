@@ -6094,6 +6094,16 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		struct reclaim_stat stat;
 		int nr_isolated = 0;
 		int i;
+		/*
+		 * Map each isolated folio back to its candidate index so we
+		 * can demote optimistic CEO_EVICTED to CEO_SHRINK_REJECT for
+		 * survivors of shrink_folio_list(). Stack-local, ≤32 entries.
+		 */
+		struct {
+			struct folio *folio;
+			int cand_idx;
+		} isolated[CACHE_EXT_MAX_EVICT_BATCH];
+		int nr_iso = 0;
 
 		active_cache_ext_ops->evict_folios(&ctx, sc->target_mem_cgroup);
 
@@ -6103,13 +6113,17 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			struct folio *folio;
 
 			mapping = (struct address_space *)ctx.candidate_ino[i];
-			if (!mapping)
+			if (!mapping) {
+				ctx.candidate_outcome[i] = CEO_NULL_MAPPING;
 				continue;
+			}
 
 			folio = filemap_get_folio(mapping,
 						  ctx.candidate_idx[i]);
-			if (IS_ERR(folio))
+			if (IS_ERR(folio)) {
+				ctx.candidate_outcome[i] = CEO_NOT_FOUND;
 				continue;
+			}
 
 			/*
 			 * Isolate from LRU.  Requires elevated refcount
@@ -6117,6 +6131,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			 * folio_isolate_lru takes its own isolation ref.
 			 */
 			if (!folio_isolate_lru(folio)) {
+				ctx.candidate_outcome[i] = CEO_ISOLATE_FAIL;
 				folio_put(folio);
 				continue;
 			}
@@ -6135,6 +6150,16 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
 			nr_isolated += folio_nr_pages(folio);
 			list_add(&folio->lru, &folio_list);
+
+			/*
+			 * Optimistic: assume this folio will be reclaimed.
+			 * Demoted to CEO_SHRINK_REJECT in the post-shrink
+			 * putback walk below if it survives.
+			 */
+			ctx.candidate_outcome[i] = CEO_EVICTED;
+			isolated[nr_iso].folio = folio;
+			isolated[nr_iso].cand_idx = i;
+			nr_iso++;
 		}
 
 		if (!list_empty(&folio_list)) {
@@ -6150,6 +6175,20 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			/* Put back folios that couldn't be reclaimed. */
 			while (!list_empty(&folio_list)) {
 				struct folio *folio = lru_to_folio(&folio_list);
+				int j;
+
+				/*
+				 * Demote optimistic CEO_EVICTED to
+				 * CEO_SHRINK_REJECT for this survivor.
+				 * Linear scan is fine (nr_iso ≤ 32).
+				 */
+				for (j = 0; j < nr_iso; j++) {
+					if (isolated[j].folio == folio) {
+						ctx.candidate_outcome[isolated[j].cand_idx] =
+							CEO_SHRINK_REJECT;
+						break;
+					}
+				}
 
 				list_del(&folio->lru);
 				folio_putback_lru(folio);
@@ -6158,6 +6197,18 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			mod_node_page_state(pgdat, NR_ISOLATED_FILE,
 					    -nr_isolated);
 		}
+
+		/*
+		 * Emit per-proposal outcomes to trace_pipe for offline
+		 * analysis. trace_printk is debug-only and emits a one-time
+		 * banner to dmesg, which is acceptable for measurement runs.
+		 */
+		for (i = 0; i < ctx.nr_candidates &&
+			    i < CACHE_EXT_MAX_EVICT_BATCH; i++)
+			trace_printk("cache_ext_outcome: mapping=%llx idx=%llu outcome=%u\n",
+				     ctx.candidate_ino[i],
+				     ctx.candidate_idx[i],
+				     ctx.candidate_outcome[i]);
 	}
 
 	if (lru_gen_enabled() && root_reclaim(sc)) {
